@@ -1,0 +1,4 @@
+#!/bin/sh
+# SageMaker runs `docker run <image> serve`; locally the argument is optional.
+[ "$1" = "serve" ] && shift
+exec uvicorn mlops.serve:app_factory --factory --host 0.0.0.0 --port 8080 --workers "${WORKERS:-2}" "$@"

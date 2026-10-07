@@ -1,0 +1,71 @@
+name: ml-pipeline
+on:
+  push: { branches: [main] }
+  pull_request:
+  schedule:
+    - cron: "0 6 * * *"   # daily drift check
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MLFLOW_DISABLE_AGENT_HINT: "1"
+  # Point these at a shared MLflow server (e.g. on ECS/RDS) in a real setup; the runner's
+  # local sqlite store keeps the workflow self-contained for the portfolio.
+  MLFLOW_TRACKING_URI: sqlite:///mlflow.db
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: pytest -q
+
+  train-and-gate:
+    needs: test
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -e .
+      # Exit code 3 = model rejected by the quality gates, which fails the job.
+      - run: python -m mlops.train --rows 20000 --n-iter 15 | tee train_result.json
+        shell: bash  # implies -o pipefail, so tee doesn't hide the exit code
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-store
+          path: |
+            mlflow.db
+            mlruns/
+            train_result.json
+
+  drift-monitor:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -e .
+      # Demo: train a champion, simulate a week of drifted traffic, then run the monitor.
+      # In production the log comes from S3 (SageMaker data capture / Firehose).
+      - run: python -m mlops.train --rows 10000 --n-iter 5
+      - name: Simulate traffic and monitor
+        run: |
+          MODEL_URI=models:/churn-classifier@champion PREDICTION_LOG=predictions.jsonl \
+            uvicorn mlops.serve:app_factory --factory --port 8080 &
+          for i in $(seq 1 60); do curl -fs localhost:8080/ping && break; sleep 2; done
+          python -m mlops.simulate --rows 3000 --price-increase 25 --m2m-share 0.75
+          python -m mlops.monitor --log predictions.jsonl --out reports || echo "DRIFT_EXIT=$?" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with: { name: drift-report, path: reports/ }
+      - name: Request retraining on drift
+        if: env.DRIFT_EXIT == '2'
+        run: echo "::warning::Data drift detected - retraining recommended (see drift-report artifact)"
